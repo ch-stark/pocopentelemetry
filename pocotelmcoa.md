@@ -1,65 +1,86 @@
-# MCOA: what is GA vs not, and how to use it
-Implementation: [stolostron/multicluster-observability-addon](https://github.com/stolostron/multicluster-observability-addon)
-## Support status
-| Signal | MCOA status | How you turn it on |
+# Fleet audit-to-metrics with MCOA and OpenTelemetry (lab)
+
+How to run [resource-flap-detection](https://github.com/michaelalang/otc-example-configurations/tree/main/resource-flap-detection) through ACM’s MultiCluster Observability Addon (MCOA) instead of applying a collector to every cluster by hand.
+
+**This is a lab.** The example is unsupported. MCOA **metrics** are GA. MCOA **logs, traces, and OpenTelemetry** are **not GA**. Do not use this pattern in production.
+
+Visualization, if any, is **Observe → Dashboards (Perses)**. This article does not ship a dashboard. Do not use Grafana.
+
+---
+
+## What MCOA is
+
+[MCOA](https://github.com/stolostron/multicluster-observability-addon) is not a metrics/logs/traces store. It is the addon ACM uses to install signal operators on managed clusters and to copy hub configuration (“stanzas”) onto those clusters.
+
+You **do not install the addon**. `multicluster-observability-operator` deploys it when you set `spec.capabilities` on `MultiClusterObservability`.
+
+| Capability | Status | This lab |
 |---|---|---|
-| **Metrics** (platform and user workloads) | **GA** | `spec.capabilities.platform.metrics` and `spec.capabilities.userWorkloads.metrics` |
-| **Logs** (ClusterLogForwarder) | **Not GA** | `spec.capabilities.*.logs` |
-| **Traces / OpenTelemetry** (collector + instrumentation) | **Not GA** | `spec.capabilities.userWorkloads.traces` |
-ACM’s `multicluster-observability-operator` deploys the addon manager when you set capabilities on `MultiClusterObservability`.
-Logs, traces, and OpenTelemetry in MCOA are preview/experimental API surfaces. They are not a supported GA ACM feature. Use them only in labs. For production logging and tracing, use the supported OpenShift operators on each cluster (Cluster Logging, Tempo, Red Hat build of OpenTelemetry) until those MCOA capabilities go GA.
+| Platform / user-workload **metrics** | **GA** | Optional; independent of flap metrics |
+| **Logs** (`ClusterLogForwarder`) | Not GA | **Off** |
+| **Traces / instrumentation** | Not GA | **Off** |
+| **OpenTelemetryCollector** | Not GA | **On** |
+
+The example **must not** run Cluster Logging. A `ClusterLogForwarder` and this collector would compete for the same log files.
+
 ---
-## What MCOA actually does
-MCOA is not a store. Thanos (ACM Observability) still holds **metrics**. Loki/Tempo/CloudWatch are out of band.
-When capabilities are enabled, MCO:
-1. Deploys `multicluster-observability-addon-manager` in `open-cluster-management-observability`
-2. Creates `ClusterManagementAddOn/multicluster-observability-addon`
-3. Installs the addon on managed clusters via addon-manager (no `ManagedClusterAddOn` for you to create)
-| Capability | Spoke operators / resources |
+
+## What the example does
+
+Repo: [otc-example-configurations/resource-flap-detection](https://github.com/michaelalang/otc-example-configurations/tree/main/resource-flap-detection)  
+Multi-cluster layout: [resource-flap-detection/multi-cluster](https://github.com/michaelalang/otc-example-configurations/tree/main/resource-flap-detection/multi-cluster)
+
+It detects **resource flapping**: two controllers or CI systems racing `update`/`patch` on the same object. It does that by reading **kube-apiserver and openshift-apiserver audit logs**, not by instrumenting apps.
+
+```
+audit.log on the node
+  → OpenTelemetry Collector (DaemonSet)
+  → parse JSON, keep verb=update|patch
+  → count connector → metric k8s_resource_flapping
+  → OTLP HTTP → Prometheus /api/v1/otlp
+```
+
+Collector shape:
+
+- **Standalone / typical spoke:** DaemonSet on **control-plane** nodes; hostPath `/var/log/kube-apiserver` and `/var/log/openshift-apiserver`. Spec: [`east/otc.yml`](https://github.com/michaelalang/otc-example-configurations/blob/main/resource-flap-detection/multi-cluster/east/otc.yml) or root [`otc.yml`](https://github.com/michaelalang/otc-example-configurations/blob/main/resource-flap-detection/otc.yml).
+- **ACM hub hosting HCPs:** DaemonSet on **all** nodes; extra receiver for hosted control-plane pod audit logs. Spec: [`acm/otc.yml`](https://github.com/michaelalang/otc-example-configurations/blob/main/resource-flap-detection/multi-cluster/acm/otc.yml). Guest HCP clusters are **not** given their own collector.
+
+Each cluster remote-writes **directly** to Prometheus. `CLUSTERNAME` is an env var on the collector (`acm`, `east`, `central`, …).
+
+Prometheus must enable:
+
+```
+--web.enable-otlp-receiver
+--enable-feature=otlp-deltatocumulative
+```
+
+The repo applies **permissions first**, then the `OpenTelemetryCollector`. Same order with MCOA: spoke SCC/SA/RBAC before the copied collector can schedule.
+
+The collector ServiceAccount is privileged enough to read host audit logs. Treat that as lab-only.
+
+---
+
+## How MCOA changes the example
+
+Do **not** run `oc create -f otc.yml` on spokes.
+
+| Example (per cluster) | ACM hub |
 |---|---|
-| Metrics (GA) | Prometheus Agent + ScrapeConfig + PrometheusRule (COO / `monitoring.rhobs`) |
-| Logs (not GA) | Cluster Logging Operator + copied `ClusterLogForwarder` |
-| Traces (not GA) | Red Hat build of OpenTelemetry + copied `OpenTelemetryCollector` / `Instrumentation` |
+| `OpenTelemetryCollector` `flapper` in `openshift-logging` | Hub stanza `instance` in `open-cluster-management-observability` |
+| Operator installed locally | MCOA installs Red Hat build of OpenTelemetry on the spoke |
+| `oc create -k` then `oc create -f otc.yml` | Same kustomize **on the spoke** (retargeted), stanza **on the hub** |
+| Grafana JSON in the repo | Ignore it. Use Perses in the console if you query the metric |
+
+MCOA copies the hub `spec` to the spoke as `mcoa-instance` in namespace **`mcoa-opentelemetry`**.
+
 ---
-## Part 1 — GA: metrics
-### Prerequisites
-- ACM Observability already running (`MultiClusterObservability/observability`)
-- Cluster Observability Operator available (ACM docs require it for this add-on path)
-- Managed clusters in a ManagedClusterSet
-### Enable
-Platform metrics are required; user-workload metrics are optional.
-```bash
-oc patch mco observability --type=merge -p '{
-  "spec": {
-    "capabilities": {
-      "platform": {
-        "metrics": { "default": { "enabled": true } }
-      },
-      "userWorkloads": {
-        "metrics": { "default": { "enabled": true } }
-      }
-    }
-  }
-}'
-```
-After this, MCO **stops** deploying the legacy metrics-collector and uses MCOA Prometheus Agents instead.
-### Verify (you did not install anything)
-```bash
-oc -n open-cluster-management-observability get deploy | grep mcoa
-oc get cma multicluster-observability-addon
-oc get prometheusagents,scrapeconfigs,prometheusrules -n open-cluster-management-observability
-oc get managedclusteraddon -A | grep observability
-```
-Default hub configs (also listed in the [MCOA README](https://github.com/stolostron/multicluster-observability-addon/blob/main/README.md)):
-- `PrometheusAgent/acm-platform-metrics-collector-default`
-- `ScrapeConfig/platform-metrics-default`
-- `PrometheusRule/platform-rules-default`
-- `PrometheusAgent/acm-user-workload-metrics-collector-default` (if user workloads enabled)
-Further GA procedures (custom metrics, relabel, remote-write, alerts) are in the ACM Observability docs, section **Multicluster observability add-on**.
----
-## Part 2 — Not GA: logs, traces, OpenTelemetry
-Treat this as a lab. Same addon, already running from Part 1 (or from any capabilities flag). Still **do not install** the addon.
-Your original CR enables the non-GA signals and leaves the collector off:
+
+## Procedure
+
+### 1. Capabilities (no addon install)
+
+Patch the existing `MultiClusterObservability`. Keep log and instrumentation flags off.
+
 ```yaml
 apiVersion: observability.open-cluster-management.io/v1beta2
 kind: MultiClusterObservability
@@ -68,55 +89,38 @@ metadata:
 spec:
   capabilities:
     platform:
-      logs:
-        collection:
-          enabled: true          # not GA
+      metrics:
+        default:
+          enabled: true    # GA; omit if you are not moving metrics to MCOA
     userWorkloads:
-      logs:
-        collection:
-          clusterLogForwarder:
-            enabled: true        # not GA
       traces:
         collection:
           instrumentation:
-            enabled: true        # not GA
+            enabled: false
           openTelemetryCollector:
-            enabled: false       # not GA; false = no spoke collector
+            enabled: true  # not GA
 ```
-Flags only install spoke operators and wait for hub stanzas. They do not create Loki, Tempo, or a pipeline.
-If you experiment with traces, set:
-```yaml
-openTelemetryCollector:
-  enabled: true
+
+Confirm MCO created the addon:
+
+```bash
+oc get cma multicluster-observability-addon
 ```
-Otherwise instrumentation has nowhere local to export.
-### Stanzas MCOA copies (from the repo)
-Create these **on the hub** in `open-cluster-management-observability`, **name: `instance`**, `managementState: unmanaged` so the hub operators do not run them. MCOA copies `spec` to spokes.
-CMA `placements[].configs` should reference (README):
-```yaml
-- group: observability.openshift.io
-  resource: clusterlogforwarders
-  name: instance
-  namespace: open-cluster-management-observability
-- group: opentelemetry.io
-  resource: opentelemetrycollectors
-  name: instance
-  namespace: open-cluster-management-observability
-- group: opentelemetry.io
-  resource: instrumentations
-  name: instance
-  namespace: open-cluster-management-observability
-```
-You still create:
-1. The stanza CRs
-2. Secrets for outputs/exporters (stanza namespace or spoke cluster namespace on the hub)
-Repo samples: [`hack/addon-install/`](https://github.com/stolostron/multicluster-observability-addon/tree/main/hack/addon-install)
-On the spoke, the collector is `OpenTelemetryCollector/mcoa-instance` in `mcoa-opentelemetry`. Apps send to:
-```
-http://mcoa-instance-collector.mcoa-opentelemetry.svc.cluster.local:4318
-```
-### Collector stanza (not GA)
-From [`otelcol-instance.yaml`](https://github.com/stolostron/multicluster-observability-addon/blob/main/hack/addon-install/templates/otelcol-instance.yaml). Point `endpoint` at **your** OTLP store (hub collector Route, Tempo, …). MCOA does not create that store.
+
+`placements[].configs` must reference `opentelemetrycollectors` / `instance` / `open-cluster-management-observability`. Do not add ClusterLogForwarder or Instrumentation configs for this lab.
+
+### 2. Spoke permissions (before the collector)
+
+MCOA does not copy SCC, ServiceAccount, or RoleBindings. Apply the example kustomize from [`resource-flap-detection/kustomization.yaml`](https://github.com/michaelalang/otc-example-configurations/blob/main/resource-flap-detection/kustomization.yaml) on **each spoke** (Policy is fine).
+
+Retarget every `openshift-logging` namespace/subject to **`mcoa-opentelemetry`**. Keep SA name `clfotlp` so it matches `spec.serviceAccount` in the collector.
+
+That set includes hostPath SCC, collect-audit-logs bindings, and k8s attribute read rights. Without it, the DaemonSet cannot read audit files.
+
+### 3. Hub stanza
+
+Create CRDs on the hub by having the OpenTelemetry operator installed there, but set **`managementState: unmanaged`** so the hub does not run this collector.
+
 ```yaml
 apiVersion: opentelemetry.io/v1beta1
 kind: OpenTelemetryCollector
@@ -125,82 +129,60 @@ metadata:
   namespace: open-cluster-management-observability
 spec:
   managementState: unmanaged
-  mode: deployment
-  config:
-    receivers:
-      otlp:
-        protocols:
-          grpc: {}
-          http: {}
-    processors: {}
-    exporters:
-      debug: {}
-      otlp:
-        endpoint: HUB_OTLP_HOST:443
-        tls:
-          insecure: false
-          ca_file: /tracing-otlp-auth/ca-bundle.crt
-          cert_file: /tracing-otlp-auth/tls.crt
-          key_file: /tracing-otlp-auth/tls.key
-    service:
-      pipelines:
-        traces:
-          receivers: [otlp]
-          processors: []
-          exporters: [otlp, debug]
-  volumeMounts:
-    - name: tracing-otlp-auth
-      mountPath: /tracing-otlp-auth
-  volumes:
-    - name: tracing-otlp-auth
-      secret:
-        secretName: tracing-otlp-auth
+  # remainder: copy spec from east/otc.yml or acm/otc.yml
 ```
-```bash
-oc -n open-cluster-management-observability create secret generic tracing-otlp-auth \
-  --from-file=tls.crt=client.crt \
-  --from-file=tls.key=client.key \
-  --from-file=ca-bundle.crt=ca.crt
-```
-### Instrumentation stanza (not GA)
-From [`instrumentation-instance.yaml`](https://github.com/stolostron/multicluster-observability-addon/blob/main/hack/addon-install/templates/instrumentation-instance.yaml):
+
+Keep from the example: `mode: daemonset`, `serviceAccount: clfotlp`, securityContext, hostPath volumes, filelog receivers, transform/filter, `count/flapping`, `otlphttp/prometheusremotewrite`.
+
+Point the exporter at your Prometheus:
+
 ```yaml
-apiVersion: opentelemetry.io/v1alpha1
-kind: Instrumentation
-metadata:
-  name: instance
-  namespace: open-cluster-management-observability
-spec:
-  exporter:
-    endpoint: http://mcoa-instance-collector.mcoa-opentelemetry.svc.cluster.local:4318
-  sampler:
-    type: parentbased_traceidratio
-    argument: "0.25"
-  propagators:
-    - jaeger
-    - b3
+exporters:
+  otlphttp/prometheusremotewrite:
+    endpoint: 'https://prometheus.apps.example.com/api/v1/otlp'
 ```
-Workloads must opt in on the **pod template**:
-```yaml
-annotations:
-  instrumentation.opentelemetry.io/inject-java: "true"
-```
-### Log stanza (not GA)
-From [`clf-instance.yaml`](https://github.com/stolostron/multicluster-observability-addon/blob/main/hack/addon-install/templates/clf-instance.yaml). Spoke SA is `openshift-logging/mcoa-logcollector`.
-Without a `ClusterLogForwarder/instance`, log flags do nothing.
-### Lab verify
+
+**Cluster name:** the example sets `CLUSTERNAME` per cluster. MCOA copies **one** spec per placement. Use different placements/stanzas per cluster set, or accept a shared label.
+
+### 4. Check rollout
+
 ```bash
-oc get cma multicluster-observability-addon -o yaml
+oc get opentelemetrycollector instance -n open-cluster-management-observability
 oc -n <spoke> get managedclusteraddon,manifestwork
-# on spoke:
-oc -n mcoa-opentelemetry get opentelemetrycollector,instrumentation,pods,svc
+
+# on the spoke
+oc -n mcoa-opentelemetry get ds,opentelemetrycollector,sa
+oc -n mcoa-opentelemetry logs -l app.kubernetes.io/name=mcoa-instance-collector --tail=50
 ```
+
+Prometheus should show `k8s_resource_flapping` or `k8s_resource_flapping_total` (OTLP often appends `_total`).
+
+### 5. Perses (optional, no dashboard here)
+
+If Cluster Observability Operator has the monitoring UI plugin with Perses enabled, open **Observe → Dashboards (Perses)** and query the Prometheus that receives OTLP. Do not import the example’s Grafana JSON. Do not apply a `PersesDashboard` as part of this procedure.
+
+Ad-hoc PromQL:
+
+```promql
+sum by (cluster) (increase(k8s_resource_flapping_total[$__rate_interval]))
+
+sum by (resource_name, source_user) (
+  changes(k8s_resource_flapping_total{replica="0"}[1h])
+)
+```
+
 ---
-## Do not
-- `kubectl apply -k deploy/` or `make addon-deploy` on a supported ACM hub
-- Expect ACM Grafana/Thanos to show MCOA traces or logs
-- Ship logs/traces via these capabilities in production while they are not GA
-## Do
-- Use MCOA **metrics** capabilities for GA fleet metrics
-- Leave log/trace/OTEL capabilities off unless you are explicitly preview-testing
-- For supported logs/traces today: configure CLO / Tempo / OTEL on the clusters themselves, not via MCOA
+
+## Cleanup
+
+Remove the hub `OpenTelemetryCollector/instance` (or set `openTelemetryCollector.enabled: false`). Delete spoke SCC/SA/bindings. Do not leave hostPath audit DaemonSets in production.
+
+---
+
+## Takeaways
+
+1. Enable MCOA only via `MultiClusterObservability.spec.capabilities`.
+2. GA = fleet **metrics**. This lab uses the **non-GA** OpenTelemetry collector capability only.
+3. The example is audit logs → Prometheus, not Tempo traces and not ClusterLogForwarder.
+4. Hub stanza `instance` + spoke RBAC in `mcoa-opentelemetry`; never `oc apply` the example collector as `flapper`/`openshift-logging` on an MCOA spoke.
+5. Graph in **Perses** if you want; this write-up does not create a dashboard.
