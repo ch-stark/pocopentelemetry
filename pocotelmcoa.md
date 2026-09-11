@@ -6,7 +6,6 @@ Implementation: [stolostron/multicluster-observability-addon](https://github.com
 | **Metrics** (platform and user workloads) | **GA** | `spec.capabilities.platform.metrics` and `spec.capabilities.userWorkloads.metrics` |
 | **Logs** (ClusterLogForwarder) | **Not GA** | `spec.capabilities.*.logs` |
 | **Traces / OpenTelemetry** (collector + instrumentation) | **Not GA** | `spec.capabilities.userWorkloads.traces` |
-Do not install MCOA from GitHub, Kustomize, Helm, or `make addon-deploy`.  
 ACM’s `multicluster-observability-operator` deploys the addon manager when you set capabilities on `MultiClusterObservability`.
 Logs, traces, and OpenTelemetry in MCOA are preview/experimental API surfaces. They are not a supported GA ACM feature. Use them only in labs. For production logging and tracing, use the supported OpenShift operators on each cluster (Cluster Logging, Tempo, Red Hat build of OpenTelemetry) until those MCOA capabilities go GA.
 ---
